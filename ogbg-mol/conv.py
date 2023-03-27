@@ -7,6 +7,10 @@ from torch_geometric.utils import degree
 
 import math
 
+import sys
+sys.path.insert(0, '..')  # noqa
+from expander import ExpanderConfig
+
 # GIN convolution along the graph structure
 
 
@@ -28,6 +32,40 @@ class GINConv(MessagePassing):
         edge_embedding = self.bond_encoder(edge_attr)
         out = self.mlp((1 + self.eps) * x +
                        self.propagate(edge_index, x=x, edge_attr=edge_embedding))
+
+        return out
+
+    def message(self, x_j, edge_attr):
+        return F.relu(x_j + edge_attr)
+
+    def update(self, aggr_out):
+        return aggr_out
+
+
+class GINConvExpander(MessagePassing):
+    def __init__(self, config: ExpanderConfig, emb_dim):
+        '''
+            emb_dim (int): node embedding dimensionality
+        '''
+
+        super(GINConvExpander, self).__init__(aggr="add")
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(emb_dim, 2*emb_dim), torch.nn.BatchNorm1d(
+            2*emb_dim), torch.nn.ReLU(), torch.nn.Linear(2*emb_dim, emb_dim))
+        self.eps = torch.nn.Parameter(torch.Tensor([0]))
+
+        if config is ExpanderConfig.DEFAULT:
+            print("Adding GINConvExpander (default)")
+            self.edge_param = torch.nn.Parameter(
+                torch.zeros(emb_dim).float(), requires_grad=False)
+        elif config is ExpanderConfig.WITH_LEARNABLE_EDGE_FEATS:
+            print("Adding GINConvExpander (with learnable edge features)")
+            self.edge_param = torch.nn.Parameter(torch.zeros(emb_dim).float())
+        else:
+            raise ValueError("Invalid value for expander config:", config)
+
+    def forward(self, x, edge_index):
+        out = self.mlp((1 + self.eps) * x +
+                       self.propagate(edge_index, x=x, edge_attr=self.edge_param))
 
         return out
 
@@ -77,12 +115,16 @@ class GNN_node(torch.nn.Module):
         node representations
     """
 
-    def __init__(self, num_layer, emb_dim, drop_ratio=0.5, JK="last", residual=False, gnn_type='gin'):
+    def __init__(self, num_layer, emb_dim, drop_ratio=0.5, JK="last", residual=False, gnn_type='gin', expander: ExpanderConfig = ExpanderConfig.NONE):
         '''
             emb_dim (int): node embedding dimensionality
             num_layer (int): number of GNN message passing layers
 
         '''
+
+        if expander is not ExpanderConfig.NONE and gnn_type != 'gin':
+            raise NotImplementedError(
+                "Expander graph propagation has not implemented for this GNN type: ", gnn_type)
 
         super(GNN_node, self).__init__()
         self.num_layer = num_layer
@@ -90,6 +132,7 @@ class GNN_node(torch.nn.Module):
         self.JK = JK
         # add residual connection or not
         self.residual = residual
+        self.expander = expander
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -102,7 +145,10 @@ class GNN_node(torch.nn.Module):
 
         for layer in range(num_layer):
             if gnn_type == 'gin':
-                self.convs.append(GINConv(emb_dim))
+                if expander is not ExpanderConfig.NONE and layer % 2 == 1:
+                    self.convs.append(GINConvExpander(expander, emb_dim))
+                else:
+                    self.convs.append(GINConv(emb_dim))
             elif gnn_type == 'gcn':
                 self.convs.append(GCNConv(emb_dim))
             else:
@@ -114,12 +160,19 @@ class GNN_node(torch.nn.Module):
     def forward(self, batched_data):
         x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
 
+        if self.expander is not ExpanderConfig.NONE:
+            expander_edge_index = batched_data.expander_edge_index
+
         # computing input node embedding
 
         h_list = [self.atom_encoder(x)]
         for layer in range(self.num_layer):
 
-            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
+            # Message passing among graph nodes
+            if self.expander is not ExpanderConfig.NONE and layer % 2 == 1:
+                h = self.convs[layer](h_list[layer], expander_edge_index)
+            else:
+                h = self.convs[layer](h_list[layer], edge_index, edge_attr)
             h = self.batch_norms[layer](h)
 
             if layer == self.num_layer - 1:
@@ -152,10 +205,13 @@ class GNN_node_Virtualnode(torch.nn.Module):
         node representations
     """
 
-    def __init__(self, num_layer, emb_dim, drop_ratio=0.5, JK="last", residual=False, gnn_type='gin'):
+    def __init__(self, num_layer, emb_dim, drop_ratio=0.5, JK="last", residual=False, gnn_type='gin', expander: ExpanderConfig = ExpanderConfig.NONE):
         '''
             emb_dim (int): node embedding dimensionality
         '''
+        if expander is not ExpanderConfig.NONE and gnn_type != 'gin':
+            raise NotImplementedError(
+                "Expander graph propagation has not implemented for this GNN type: ", gnn_type)
 
         super(GNN_node_Virtualnode, self).__init__()
         self.num_layer = num_layer
@@ -163,6 +219,7 @@ class GNN_node_Virtualnode(torch.nn.Module):
         self.JK = JK
         # add residual connection or not
         self.residual = residual
+        self.expander = expander
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -183,7 +240,10 @@ class GNN_node_Virtualnode(torch.nn.Module):
 
         for layer in range(num_layer):
             if gnn_type == 'gin':
-                self.convs.append(GINConv(emb_dim))
+                if expander is not ExpanderConfig.NONE and layer % 2 == 1:
+                    self.convs.append(GINConvExpander(expander, emb_dim))
+                else:
+                    self.convs.append(GINConv(emb_dim))
             elif gnn_type == 'gcn':
                 self.convs.append(GCNConv(emb_dim))
             else:
@@ -200,6 +260,9 @@ class GNN_node_Virtualnode(torch.nn.Module):
 
         x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
 
+        if self.expander is not ExpanderConfig.NONE:
+            expander_edge_index = batched_data.expander_edge_index
+
         # virtual node embeddings for graphs
         virtualnode_embedding = self.virtualnode_embedding(torch.zeros(
             batch[-1].item() + 1).to(edge_index.dtype).to(edge_index.device))
@@ -210,7 +273,10 @@ class GNN_node_Virtualnode(torch.nn.Module):
             h_list[layer] = h_list[layer] + virtualnode_embedding[batch]
 
             # Message passing among graph nodes
-            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
+            if self.expander is not ExpanderConfig.NONE and layer % 2 == 1:
+                h = self.convs[layer](h_list[layer], expander_edge_index)
+            else:
+                h = self.convs[layer](h_list[layer], edge_index, edge_attr)
 
             h = self.batch_norms[layer](h)
             if layer == self.num_layer - 1:

@@ -12,6 +12,11 @@ import numpy as np
 # importing OGB
 from ogb.graphproppred import PygGraphPropPredDataset, Evaluator
 
+import sys
+sys.path.insert(0, '..')  # noqa
+from expander import ExpanderConfig, ExpanderGraphStore
+from utils import add_master_node
+
 cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
 
@@ -91,13 +96,35 @@ def main():
                         help='full feature or simple feature')
     parser.add_argument('--filename', type=str, default="",
                         help='filename to output result (default: )')
+    parser.add_argument('--expander', type=int, default=0,
+                        help='expander graph propagation toggle (off (0), on (1), on with learnable edge parameters (2))')
+    parser.add_argument('--simple_master_node', type=int, default=0,
+                        help='simple master (virtual) node (off (0), on (1))')
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.device)
                           ) if torch.cuda.is_available() else torch.device("cpu")
 
+    if not args.filename == '':
+        import os
+        assert not os.path.exists(args.filename), "Filename already exists"
+
+    assert not (args.simple_master_node != 0 and args.expander !=
+                0), 'Cannot both have a simple master node and an expander graph'
+
     # automatic dataloading and splitting
-    dataset = PygGraphPropPredDataset(name=args.dataset)
+    expander = ExpanderConfig(args.expander)
+    if expander is not ExpanderConfig.NONE:
+        expander_store = ExpanderGraphStore()
+        dataset = PygGraphPropPredDataset(
+            name=args.dataset, transform=expander_store.transform_fn())
+    elif args.simple_master_node == 1:
+        print("Adding simple master nodes.")
+        dataset = PygGraphPropPredDataset(
+            name=args.dataset, transform=lambda x: add_master_node(x))
+    else:
+        dataset = PygGraphPropPredDataset(
+            name=args.dataset)
 
     if args.feature == 'full':
         pass
@@ -121,19 +148,18 @@ def main():
 
     if args.gnn == 'gin':
         model = GNN(gnn_type='gin', num_tasks=dataset.num_tasks, num_layer=args.num_layer,
-                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=False).to(device)
+                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=False, expander=expander).to(device)
     elif args.gnn == 'gin-virtual':
         model = GNN(gnn_type='gin', num_tasks=dataset.num_tasks, num_layer=args.num_layer,
-                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=True).to(device)
+                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=True, expander=expander).to(device)
     elif args.gnn == 'gcn':
         model = GNN(gnn_type='gcn', num_tasks=dataset.num_tasks, num_layer=args.num_layer,
-                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=False).to(device)
+                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=False, expander=expander).to(device)
     elif args.gnn == 'gcn-virtual':
         model = GNN(gnn_type='gcn', num_tasks=dataset.num_tasks, num_layer=args.num_layer,
-                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=True).to(device)
+                    emb_dim=args.emb_dim, drop_ratio=args.drop_ratio, virtual_node=True, expander=expander).to(device)
     else:
         raise ValueError('Invalid GNN type')
-
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     valid_curve = []
@@ -169,7 +195,9 @@ def main():
 
     if not args.filename == '':
         torch.save({'Val': valid_curve[best_val_epoch], 'Test': test_curve[best_val_epoch],
-                   'Train': train_curve[best_val_epoch], 'BestTrain': best_train}, args.filename)
+                   'Train': train_curve[best_val_epoch], 'BestTrain': best_train,
+                    'train_curve': train_curve, 'valid_curve': valid_curve,
+                    'args': vars(args)}, args.filename)
 
 
 if __name__ == "__main__":
